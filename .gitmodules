@@ -1,0 +1,9 @@
+[submodule "libs/bbb-artnet"]
+	path = libs/bbb-artnet
+	url = https://github.com/2bbb/bbb-artnet.git
+[submodule "libs/asio"]
+	path = libs/asio
+	url = https://github.com/2bbb/asio.git
+[submodule "libs/bbb.dmx"]
+	path = libs/bbb.dmx
+	url = https://github.com/2bbb/bbb.dmx.git
