@@ -7,4 +7,4 @@ meta:
 
 common:
 	ADDON_DEFINES = ASIO_STANDALONE=1 MINIZ_NO_ZLIB_COMPATIBLE_NAMES=1
-	ADDON_INCLUDES = src libs/bbb-artnet/include libs/asio/asio/include libs/bbb.dmx/source libs/miniz
+	ADDON_INCLUDES = src libs/bbb-artnet/include libs/asio/asio/include libs/bbb-dmx/include libs/miniz

@@ -4,6 +4,6 @@
 [submodule "libs/asio"]
 	path = libs/asio
 	url = https://github.com/2bbb/asio.git
-[submodule "libs/bbb.dmx"]
-	path = libs/bbb.dmx
-	url = https://github.com/2bbb/bbb.dmx.git
+[submodule "libs/bbb-dmx"]
+	path = libs/bbb-dmx
+	url = git@github.com:2bbb/bbb-dmx.git
