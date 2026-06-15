@@ -23,6 +23,7 @@
 // bbb.dmx: fixture profile / patch data model + JSON loader (Max-independent layer)
 #include "bbb/dmx/fixture_json.hpp"
 #include "bbb/dmx/aim.hpp"
+#include "bbb/dmx/color_mapping.hpp"
 
 #include "ofMain.h"
 #include "ofJson.h"
@@ -469,6 +470,39 @@ namespace bbb { namespace dmx { namespace ofx {
 		return 1.f;
 	}
 
+	// resolve a color-wheel parameter's current DMX value to a display color
+	// using the profile's wheel-slot metadata (bbb-dmx color wheel fallback
+	// data, GDTF-derived). Reverse of the sender-side RGB->nearest-slot mapping.
+	inline bool color_wheel_color(const fixture_view &view,
+	                              const universe_map &universes,
+	                              int universe_base,
+	                              ofFloatColor &out)
+	{
+		if(!view.valid()) {
+			return false;
+		}
+		for(const auto &parameter : view.mode->parameters) {
+			if(!bbb::dmx::parameter_is_likely_color_wheel(parameter)) {
+				continue;
+			}
+			const auto sample = read_parameter(view, parameter.key, universes, universe_base);
+			if(!sample.found) {
+				continue;
+			}
+			for(const auto &range : parameter.ranges) {
+				if(range.from <= sample.raw && sample.raw <= range.to) {
+					bbb::dmx::semantic_color_request slot_color{};
+					if(bbb::dmx::color_from_range_metadata(view.profile, parameter, range, slot_color)) {
+						out = ofFloatColor{(float)slot_color.red, (float)slot_color.green, (float)slot_color.blue};
+						return true;
+					}
+					return false;  // matched the active range but it carries no color
+				}
+			}
+		}
+		return false;
+	}
+
 	struct render_options {
 	public:
 		int universe_base{0};
@@ -499,12 +533,18 @@ namespace bbb { namespace dmx { namespace ofx {
 		const auto magenta = read_parameter(view, "magenta", universes, base);
 		const auto yellow = read_parameter(view, "yellow", universes, base);
 
+		ofFloatColor wheel_color{};
+		const bool has_wheel{color_wheel_color(view, universes, base, wheel_color)};
 		if(red.found || green.found || blue.found) {
 			state.color = ofFloatColor{(float)red.normalized, (float)green.normalized, (float)blue.normalized};
 		} else if(cyan.found || magenta.found || yellow.found) {
 			state.color = ofFloatColor{1.f - (float)cyan.normalized,
 			                           1.f - (float)magenta.normalized,
 			                           1.f - (float)yellow.normalized};
+		} else if(has_wheel) {
+			// no additive/subtractive mixing channels: a color wheel is the
+			// fixture's only hue source, so it sets the color outright.
+			state.color = wheel_color;
 		} else {
 			state.color = ofFloatColor{1.f, 1.f, 1.f};
 		}
