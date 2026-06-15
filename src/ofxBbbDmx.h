@@ -1011,13 +1011,24 @@ namespace bbb { namespace dmx { namespace ofx {
 			result.error = "FixtureType element not found";
 			return result;
 		}
-		std::string name{fixture_type.getAttribute("Name").getValue()};
-		if(name.empty()) {
-			name = fixture_type.getAttribute("ShortName").getValue();
-		}
-		std::string manufacturer{fixture_type.getAttribute("Manufacturer").getValue()};
+		// attribute precedence mirrors bbb-dmx-utils so the profile key matches
+		// the CLI byte-for-byte. GLP-style fixtures repeat the manufacturer in
+		// LongName ("GLP JDC 1"), so LongName-first yields glp.glp.jdc.1 rather
+		// than the shorter glp.jdc.1 -- the longer key is preferred (less likely
+		// to collide than a name shared across vendors).
+		const auto first_attribute = [&](std::initializer_list<const char *> names) -> std::string {
+			for(const char *attribute : names) {
+				const std::string value{fixture_type.getAttribute(attribute).getValue()};
+				if(!value.empty()) {
+					return value;
+				}
+			}
+			return "";
+		};
+		std::string name{first_attribute({"LongName", "Name", "ShortName", "Model", "model"})};
+		std::string manufacturer{first_attribute({"Manufacturer", "manufacturer", "Company", "Vendor"})};
 		if(manufacturer.empty()) {
-			manufacturer = "unknown";
+			manufacturer = "Unknown";
 		}
 		result.profile_key = sanitize_key(manufacturer) + "." + sanitize_key(name);
 
