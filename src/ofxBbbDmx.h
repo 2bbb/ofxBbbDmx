@@ -470,9 +470,32 @@ namespace bbb { namespace dmx { namespace ofx {
 		return 1.f;
 	}
 
+	// treat a parameter as a color-wheel source if it carries wheel metadata, or
+	// if it is simply named "color"/"colour" with a range table — older imports
+	// store the wheel as a "color" parameter whose ranges only have descriptive
+	// function/label slugs (e.g. "deep.red.positioning"), which still resolve via
+	// name matching. Color temperature / macro params are excluded.
+	inline bool is_color_wheel_parameter(const bbb::dmx::fixture_parameter &parameter) {
+		if(bbb::dmx::parameter_is_likely_color_wheel(parameter)) {
+			return true;
+		}
+		const std::string key{bbb::dmx::normalized_color_key(parameter.key)};
+		if(key.find("color") == std::string::npos && key.find("colour") == std::string::npos) {
+			return false;
+		}
+		if(key.find("temperature") != std::string::npos
+		   || key.find("macro") != std::string::npos
+		   || key.find("correction") != std::string::npos
+		   || key == "ctc" || key == "cto" || key == "ctb") {
+			return false;
+		}
+		return 2 <= parameter.ranges.size();
+	}
+
 	// resolve a color-wheel parameter's current DMX value to a display color
 	// using the profile's wheel-slot metadata (bbb-dmx color wheel fallback
-	// data, GDTF-derived). Reverse of the sender-side RGB->nearest-slot mapping.
+	// data, GDTF-derived) or range function/label name matching. Reverse of the
+	// sender-side RGB->nearest-slot mapping.
 	inline bool color_wheel_color(const fixture_view &view,
 	                              const universe_map &universes,
 	                              int universe_base,
@@ -482,7 +505,7 @@ namespace bbb { namespace dmx { namespace ofx {
 			return false;
 		}
 		for(const auto &parameter : view.mode->parameters) {
-			if(!bbb::dmx::parameter_is_likely_color_wheel(parameter)) {
+			if(!is_color_wheel_parameter(parameter)) {
 				continue;
 			}
 			const auto sample = read_parameter(view, parameter.key, universes, universe_base);
@@ -496,7 +519,7 @@ namespace bbb { namespace dmx { namespace ofx {
 						out = ofFloatColor{(float)slot_color.red, (float)slot_color.green, (float)slot_color.blue};
 						return true;
 					}
-					return false;  // matched the active range but it carries no color
+					break;  // active range carries no color; try another color param
 				}
 			}
 		}
