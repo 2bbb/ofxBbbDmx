@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <set>
 
 namespace bbb { namespace dmx { namespace ofx {
@@ -698,28 +699,40 @@ namespace bbb { namespace dmx { namespace ofx {
 		std::vector<std::string> warnings{};
 	};
 
-	// GDTF attribute name -> bbb.dmx semantic parameter key
+	// GDTF attribute name -> bbb.dmx semantic parameter key. Mirrors the
+	// regex-pair logic of bbb-dmx-utils normalizeAttributeName (substring match
+	// on the lowercased attribute, first hit wins; unknown -> slug) so importer
+	// output stays byte-identical to the CLI.
 	inline std::string map_gdtf_attribute(const std::string &attribute) {
-		static const std::map<std::string, std::string> table{
-			{"Pan", "pan"}, {"Tilt", "tilt"}, {"Dimmer", "dimmer"},
-			{"ColorAdd_R", "red"}, {"ColorRGB_Red", "red"},
-			{"ColorAdd_G", "green"}, {"ColorRGB_Green", "green"},
-			{"ColorAdd_B", "blue"}, {"ColorRGB_Blue", "blue"},
-			{"ColorAdd_W", "white"}, {"ColorRGB_White", "white"},
-			{"ColorAdd_C", "cyan"}, {"ColorSub_C", "cyan"},
-			{"ColorAdd_M", "magenta"}, {"ColorSub_M", "magenta"},
-			{"ColorAdd_Y", "yellow"}, {"ColorSub_Y", "yellow"},
-			{"ColorAdd_RY", "amber"}, {"Amber", "amber"},
-			{"ColorAdd_UV", "uv"}, {"UV", "uv"},
-			{"Color1", "color"}, {"Color2", "color2"},
-			{"Gobo1", "gobo"}, {"Gobo2", "gobo2"},
-			{"Shutter1", "shutter"}, {"Shutter1Strobe", "shutter"},
-			{"Zoom", "zoom"}, {"Focus1", "focus"}, {"Iris", "iris"},
-			{"CTO", "ctc"}, {"CTB", "ctc"}, {"CTC", "ctc"}, {"Frost1", "frost"},
+		const std::string normalized{to_lower(attribute)};
+		static const std::vector<std::pair<std::regex, std::string>> pairs{
+			{std::regex(R"(^pan$|panrotate|pan rotate|^p\b)"), "pan"},
+			{std::regex(R"(^tilt$|tiltrotate|tilt rotate|^t\b)"), "tilt"},
+			{std::regex(R"(dimmer|intensity|master)"), "dimmer"},
+			{std::regex(R"(shutter|strobe)"), "shutter"},
+			{std::regex(R"(coloradd[_\s-]*r|additive.*red|\bred\b|^r$)"), "red"},
+			{std::regex(R"(coloradd[_\s-]*g|additive.*green|\bgreen\b|^g$)"), "green"},
+			{std::regex(R"(coloradd[_\s-]*b|additive.*blue|\bblue\b|^b$)"), "blue"},
+			{std::regex(R"(white|coloradd[_\s-]*w|^w$)"), "white"},
+			{std::regex(R"(amber|coloradd[_\s-]*a|^a$)"), "amber"},
+			{std::regex(R"(uv|ultraviolet)"), "uv"},
+			{std::regex(R"(cyan)"), "cyan"},
+			{std::regex(R"(magenta)"), "magenta"},
+			{std::regex(R"(yellow)"), "yellow"},
+			{std::regex(R"(zoom)"), "zoom"},
+			{std::regex(R"(focus)"), "focus"},
+			{std::regex(R"(iris)"), "iris"},
+			{std::regex(R"(gobo)"), "gobo"},
+			{std::regex(R"(colorwheel|color wheel|^color$)"), "color"},
+			{std::regex(R"(cto|ctb|ctc|color temperature)"), "ctc"},
+			{std::regex(R"(prism)"), "prism"},
+			{std::regex(R"(frost)"), "frost"},
+			{std::regex(R"(speed)"), "speed"},
 		};
-		const auto found = table.find(attribute);
-		if(found != table.end()) {
-			return found->second;
+		for(const auto &pair : pairs) {
+			if(std::regex_search(normalized, pair.first)) {
+				return pair.second;
+			}
 		}
 		return sanitize_key(attribute);
 	}
@@ -747,10 +760,184 @@ namespace bbb { namespace dmx { namespace ofx {
 		long long to{0};
 		std::string function{};
 		std::string label{};
+		std::string wheel{};        // referenced wheels[].id (bbb-dmx color wheel data)
+		bool has_wheel_slot{false};
+		int wheel_slot{0};
 		bool has_physical{false};
 		double physical_from{0.0};
 		double physical_to{0.0};
 	};
+
+	// integral numbers as int, fractional as double (matches bbb-dmx-utils output)
+	inline ordered_json json_number(double value) {
+		if(value == std::floor(value)) {
+			return (long long)value;
+		}
+		return value;
+	}
+
+	// GDTF ChannelFunction @Wheel -> wheels[].id reference
+	inline std::string wheel_name_for_function(const ofXml &function_node) {
+		std::string raw{function_node.getAttribute("Wheel").getValue()};
+		if(raw.empty()) {
+			raw = function_node.getAttribute("WheelName").getValue();
+		}
+		return raw.empty() ? std::string{} : sanitize_key(raw, raw);
+	}
+
+	// GDTF ChannelSet/ChannelFunction @WheelSlotIndex (1-based)
+	inline bool wheel_slot_index_for_node(const ofXml &node, int &out_slot) {
+		for(const char *attribute : {"WheelSlotIndex", "WheelSlot", "Slot"}) {
+			const std::string text{node.getAttribute(attribute).getValue()};
+			if(!text.empty()) {
+				const int value{(int)std::lround(ofToDouble(text))};
+				if(0 < value) {
+					out_slot = value;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	inline std::string wheel_type_from_name(const std::string &name) {
+		const std::string normalized{to_lower(name)};
+		if(normalized.find("color") != std::string::npos || normalized.find("colour") != std::string::npos
+		   || normalized.find("cto") != std::string::npos || normalized.find("ctb") != std::string::npos
+		   || normalized.find("ctc") != std::string::npos) {
+			return "color";
+		}
+		if(normalized.find("gobo") != std::string::npos) {
+			return "gobo";
+		}
+		if(normalized.find("anim") != std::string::npos) {
+			return "animation";
+		}
+		if(normalized.find("prism") != std::string::npos) {
+			return "prism";
+		}
+		return "generic";
+	}
+
+	// parse a GDTF color string ("{x,y,Y}" or "x,y,Y") into up to 3 numbers
+	inline bool parse_color_numbers(const std::string &text, std::array<double, 3> &out) {
+		std::string cleaned{text};
+		for(char &c : cleaned) {
+			if(c == '{' || c == '}') {
+				c = ' ';
+			}
+		}
+		std::vector<double> values{};
+		for(const auto &part : ofSplitString(cleaned, ",", true, true)) {
+			for(const auto &token : ofSplitString(part, " ", true, true)) {
+				const std::string trimmed{ofTrim(token)};
+				if(!trimmed.empty()) {
+					values.push_back(ofToDouble(trimmed));
+				}
+			}
+		}
+		if(values.size() < 3) {
+			return false;
+		}
+		out = {values[0], values[1], values[2]};
+		return true;
+	}
+
+	inline bool color_name_to_rgb(const std::string &name, std::array<int, 3> &out) {
+		const std::string n{to_lower(name)};
+		const auto has = [&](const char *needle) { return n.find(needle) != std::string::npos; };
+		if(has("open") || has("white")) { out = {255, 255, 255}; return true; }
+		if(has("red"))                  { out = {255, 0, 0};     return true; }
+		if(has("green"))                { out = {0, 255, 0};     return true; }
+		if(has("blue"))                 { out = {0, 0, 255};     return true; }
+		if(has("cyan"))                 { out = {0, 255, 255};   return true; }
+		if(has("magenta") || has("pink")) { out = {255, 0, 255}; return true; }
+		if(has("yellow"))               { out = {255, 255, 0};   return true; }
+		if(has("amber") || has("orange")) { out = {255, 115, 0}; return true; }
+		if(has("lime"))                 { out = {115, 255, 0};   return true; }
+		if(has("purple") || has("violet") || n == "uv") { out = {115, 0, 255}; return true; }
+		return false;
+	}
+
+	// emit profile-level wheels[] from GDTF <Wheels>/<Wheel> (bbb-dmx color wheel
+	// metadata; mirrors bbb-dmx-utils fixtureWheelsFromGdtf for byte parity)
+	inline ordered_json gdtf_wheels(const ofXml &fixture_type) {
+		ordered_json wheels_json(ordered_json::value_t::array);
+		auto wheel_nodes = fixture_type.find("Wheels/Wheel");
+		if(wheel_nodes.empty()) {
+			wheel_nodes = fixture_type.find("//Wheel");
+		}
+		int wheel_index{0};
+		for(auto &wheel_node : wheel_nodes) {
+			wheel_index++;
+			std::string label{wheel_node.getAttribute("Name").getValue()};
+			if(label.empty()) {
+				label = "Wheel " + std::to_string(wheel_index);
+			}
+			ordered_json wheel_json{};
+			wheel_json["id"] = sanitize_key(label, "wheel" + std::to_string(wheel_index));
+			wheel_json["label"] = label;
+			wheel_json["type"] = wheel_type_from_name(label);
+
+			std::vector<ofXml> slot_nodes{};
+			for(auto &slot : wheel_node.getChildren("Slot")) {
+				slot_nodes.push_back(slot);
+			}
+			for(auto &nested : wheel_node.find("Slots/Slot")) {
+				slot_nodes.push_back(nested);
+			}
+			ordered_json slots_json(ordered_json::value_t::array);
+			int slot_index{0};
+			for(auto &slot_node : slot_nodes) {
+				slot_index++;
+				std::string slot_label{slot_node.getAttribute("Name").getValue()};
+				if(slot_label.empty()) {
+					slot_label = "Slot " + std::to_string(slot_index);
+				}
+				ordered_json slot_json{};
+				slot_json["index"] = slot_index;
+				slot_json["id"] = sanitize_key(slot_label, "slot" + std::to_string(slot_index));
+				slot_json["label"] = slot_label;
+				slot_json["kind"] = (to_lower(slot_label).find("open") != std::string::npos) ? "open" : "color";
+				std::array<double, 3> color_values{};
+				std::array<double, 3> rgb_values{};
+				std::array<int, 3> named_rgb{};
+				std::string rgb_text{slot_node.getAttribute("RGB").getValue()};
+				if(rgb_text.empty()) {
+					rgb_text = slot_node.getAttribute("sRGB").getValue();
+				}
+				std::string cie_text{slot_node.getAttribute("Color").getValue()};
+				if(cie_text.empty()) {
+					cie_text = slot_node.getAttribute("ColorCIE").getValue();
+				}
+				if(!rgb_text.empty() && parse_color_numbers(rgb_text, rgb_values)) {
+					slot_json["rgb"] = {
+						std::max(0, std::min(255, (int)std::lround(rgb_values[0]))),
+						std::max(0, std::min(255, (int)std::lround(rgb_values[1]))),
+						std::max(0, std::min(255, (int)std::lround(rgb_values[2])))
+					};
+				} else if(!cie_text.empty() && parse_color_numbers(cie_text, color_values)) {
+					slot_json["cie_xyY"] = {json_number(color_values[0]), json_number(color_values[1]), json_number(color_values[2])};
+				} else if(color_name_to_rgb(slot_label, named_rgb)) {
+					slot_json["rgb"] = {named_rgb[0], named_rgb[1], named_rgb[2]};
+				}
+				const std::string filter{slot_node.getAttribute("Filter").getValue()};
+				const std::string media{slot_node.getAttribute("MediaFileName").getValue()};
+				if(!filter.empty()) {
+					slot_json["filter"] = filter;
+				}
+				if(!media.empty()) {
+					slot_json["media"] = media;
+				}
+				slots_json.push_back(slot_json);
+			}
+			if(!slots_json.empty()) {
+				wheel_json["slots"] = slots_json;
+			}
+			wheels_json.push_back(wheel_json);
+		}
+		return wheels_json;
+	}
 
 	// ChannelFunction attribute / ChannelSet name -> range function key
 	inline std::string range_function_key(const std::string &attribute, const std::string &set_name) {
@@ -972,11 +1159,18 @@ namespace bbb { namespace dmx { namespace ofx {
 				std::vector<gdtf_range_entry> range_entries{};
 				int function_count{0};
 				int named_set_count{0};
+				std::string parameter_wheel{};
 				if(logical) {
 					for(auto &function_node : logical.getChildren("ChannelFunction")) {
 						function_count++;
 						const std::string function_attribute{function_node.getAttribute("Attribute").getValue()};
 						const std::string function_label{function_node.getAttribute("Name").getValue()};
+						const std::string function_wheel{wheel_name_for_function(function_node)};
+						if(parameter_wheel.empty() && !function_wheel.empty()) {
+							parameter_wheel = function_wheel;
+						}
+						int function_slot{0};
+						const bool function_has_slot{wheel_slot_index_for_node(function_node, function_slot)};
 						long long function_from{0};
 						int from_bytes{1};
 						if(parse_gdtf_dmx_value(function_node.getAttribute("DMXFrom").getValue(),
@@ -996,7 +1190,13 @@ namespace bbb { namespace dmx { namespace ofx {
 							&& physical_from != physical_to
 						};
 
-						std::vector<std::pair<long long, std::string>> named_sets{};
+						struct named_set_info {
+							long long from{0};
+							std::string name{};
+							bool has_slot{false};
+							int slot{0};
+						};
+						std::vector<named_set_info> named_sets{};
 						for(auto &set_node : function_node.getChildren("ChannelSet")) {
 							const std::string set_name{set_node.getAttribute("Name").getValue()};
 							if(set_name.empty()) {
@@ -1010,7 +1210,11 @@ namespace bbb { namespace dmx { namespace ofx {
 							}
 							set_from = std::max(0LL, std::min(type_max,
 								scale_dmx_value(set_from, set_bytes, byte_count)));
-							named_sets.push_back({set_from, set_name});
+							named_set_info set_info{};
+							set_info.from = set_from;
+							set_info.name = set_name;
+							set_info.has_slot = wheel_slot_index_for_node(set_node, set_info.slot);
+							named_sets.push_back(set_info);
 							named_set_count++;
 						}
 
@@ -1018,8 +1222,11 @@ namespace bbb { namespace dmx { namespace ofx {
 							gdtf_range_entry entry{};
 							entry.from = function_from;
 							entry.function = range_function_key(function_attribute,
-								named_sets.empty() ? "" : named_sets.front().second);
-							entry.label = named_sets.empty() ? function_label : named_sets.front().second;
+								named_sets.empty() ? "" : named_sets.front().name);
+							entry.label = named_sets.empty() ? function_label : named_sets.front().name;
+							entry.wheel = function_wheel;
+							entry.has_wheel_slot = function_has_slot;
+							entry.wheel_slot = function_slot;
 							const std::string &key = entry.function;
 							entry.has_physical = function_has_physical
 								&& (key == "strobe" || key == "pulse" || key == "random");
@@ -1027,18 +1234,22 @@ namespace bbb { namespace dmx { namespace ofx {
 							entry.physical_to = physical_to;
 							range_entries.push_back(entry);
 						} else {
-							if(function_from < named_sets.front().first) {
+							if(function_from < named_sets.front().from) {
 								gdtf_range_entry lead{};
 								lead.from = function_from;
 								lead.function = range_function_key(function_attribute, "");
 								lead.label = function_label;
+								lead.wheel = function_wheel;
 								range_entries.push_back(lead);
 							}
 							for(const auto &named_set : named_sets) {
 								gdtf_range_entry entry{};
-								entry.from = named_set.first;
-								entry.function = range_function_key(function_attribute, named_set.second);
-								entry.label = named_set.second;
+								entry.from = named_set.from;
+								entry.function = range_function_key(function_attribute, named_set.name);
+								entry.label = named_set.name;
+								entry.wheel = function_wheel;
+								entry.has_wheel_slot = named_set.has_slot;
+								entry.wheel_slot = named_set.slot;
 								range_entries.push_back(entry);
 							}
 						}
@@ -1095,6 +1306,9 @@ namespace bbb { namespace dmx { namespace ofx {
 						parameter_json["range_degrees"] = range;
 					}
 				}
+				if(!parameter_wheel.empty()) {
+					parameter_json["wheel"] = parameter_wheel;
+				}
 				if(emit_ranges) {
 					std::stable_sort(range_entries.begin(), range_entries.end(),
 					                 [](const gdtf_range_entry &a, const gdtf_range_entry &b) {
@@ -1117,6 +1331,12 @@ namespace bbb { namespace dmx { namespace ofx {
 						range_json["function"] = entry.function;
 						if(!entry.label.empty()) {
 							range_json["label"] = entry.label;
+						}
+						if(!entry.wheel.empty()) {
+							range_json["wheel"] = entry.wheel;
+						}
+						if(entry.has_wheel_slot) {
+							range_json["wheel_slot"] = entry.wheel_slot;
 						}
 						if(entry.has_physical) {
 							// integral values as int, matching bbb-dmx-convert output
@@ -1191,6 +1411,14 @@ namespace bbb { namespace dmx { namespace ofx {
 			if(!photometry_json.empty()) {
 				profile_json["photometry"] = photometry_json;
 			}
+		}
+
+		// optional wheels[] from GDTF <Wheels> (bbb-dmx color wheel metadata),
+		// emitted after photometry to match bbb-dmx-utils output. NB: copy-init,
+		// not brace-init -- ordered_json{array} would double-wrap the array.
+		const ordered_json wheels_json = gdtf_wheels(fixture_type);
+		if(!wheels_json.empty()) {
+			profile_json["wheels"] = wheels_json;
 		}
 
 		ofDirectory::createDirectory(fixtures_directory, false, true);
