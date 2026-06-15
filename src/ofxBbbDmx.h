@@ -118,6 +118,7 @@ namespace bbb { namespace dmx { namespace ofx {
 	struct universe_state {
 		std::array<std::uint8_t, 512> data{};
 		std::uint64_t packet_count{0};
+		int last_length{0};  // channels in the most recent ArtDmx (senders may truncate < 512)
 		steady_clock::time_point last_packet{};
 	};
 
@@ -152,6 +153,7 @@ namespace bbb { namespace dmx { namespace ofx {
 				const std::size_t copy_length{std::min<std::size_t>((std::size_t)length, universe.data.size())};
 				std::memcpy(universe.data.data(), data, copy_length);
 				universe.packet_count++;
+				universe.last_length = length;
 				universe.last_packet = steady_clock::now();
 				total_packets_++;
 			};
