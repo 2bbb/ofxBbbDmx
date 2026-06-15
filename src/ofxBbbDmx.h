@@ -410,11 +410,15 @@ namespace bbb { namespace dmx { namespace ofx {
 	// shutter handling. with a "ranges" table (bbb.dmx issue #7) the DMX value is
 	// looked up exactly: closed / open / strobe / pulse / random, rate from the
 	// physical Hz pair when present, otherwise pseudo (position within the range).
-	// without a table: pseudo model (0 = closed, mid = strobe, top = open),
-	// applied only when live DMX is present so profile defaults (often 0) do not
-	// black out an idle scene.
+	// without a table: pseudo model (0 = closed, mid = strobe, top = open).
+	//
+	// both paths are gated on live DMX: a fixture is never blacked out purely by
+	// a profile shutter default (commonly 0 = closed in GDTF) when no console is
+	// driving its universe. otherwise a patch mixing fixtures whose shutter
+	// default maps to "open" with ones that map to "closed" would render an
+	// inconsistent half-dark idle scene.
 	inline float shutter_factor(const fixture_view &view, const parameter_sample &shutter, double time) {
-		if(!shutter.found) {
+		if(!shutter.found || !shutter.live) {
 			return 1.f;
 		}
 		const auto *parameter = view.valid() ? view.mode->find_parameter("shutter") : nullptr;
@@ -451,9 +455,6 @@ namespace bbb { namespace dmx { namespace ofx {
 				return noise < 0.5 ? 1.f : 0.f;
 			}
 			return 1.f;  // open / unknown slugs pass through
-		}
-		if(!shutter.live) {
-			return 1.f;
 		}
 		const double value{shutter.normalized};
 		if(value < 0.02) {
