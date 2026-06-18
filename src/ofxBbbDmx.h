@@ -527,10 +527,124 @@ namespace bbb { namespace dmx { namespace ofx {
 		return false;
 	}
 
+	// ------------------------------------------------------------------
+	// semantic overrides (bbb.dmx.semantic_overrides.v1)
+	//
+	// Per profile+mode hints that remap awkward GDTF-derived parameter keys onto
+	// the renderer's color / intensity model. Reuses the very file the bbb.dmx
+	// tooling consumes (bin/data/semantic-overrides.json). The importer keeps
+	// emitting keys byte-identical to bbb-dmx-utils (e.g. ColorSub_C -> colorsub.c);
+	// the override layer is where those map back to cyan/magenta/yellow etc.
+	// ------------------------------------------------------------------
+
+	struct semantic_color_group {
+		bool subtractive{false};                          // true: cmy, false: rgb
+		std::string red{}, green{}, blue{}, white{};      // rgb keys (white optional)
+		std::string cyan{}, magenta{}, yellow{};          // cmy keys
+		std::string dimmer{};                             // optional per-emitter intensity key
+	};
+
+	struct semantic_mode_override {
+		std::vector<std::string> intensity_parameters{};  // contributors; brightest wins
+		std::vector<semantic_color_group> color_groups{};
+	};
+
+	// profile.key -> mode.key -> override
+	using semantic_overrides = std::map<std::string, std::map<std::string, semantic_mode_override>>;
+
+	inline const semantic_mode_override *find_semantic_override(
+		const semantic_overrides *table,
+		const std::string &profile_key,
+		const std::string &mode_key)
+	{
+		if(table == nullptr) {
+			return nullptr;
+		}
+		const auto profile = table->find(profile_key);
+		if(profile == table->end()) {
+			return nullptr;
+		}
+		const auto mode = profile->second.find(mode_key);
+		if(mode == profile->second.end()) {
+			return nullptr;
+		}
+		return &mode->second;
+	}
+
+	inline semantic_overrides load_semantic_overrides(const std::string &path) {
+		semantic_overrides table{};
+		if(!ofFile::doesFileExist(path)) {
+			return table;
+		}
+		ofJson root{};
+		try {
+			root = ofLoadJson(path);
+		} catch(const std::exception &e) {
+			ofLogError("lsim::load_semantic_overrides") << "failed to parse " << path << ": " << e.what();
+			return table;
+		}
+		if(!root.contains("profiles")) {
+			return table;
+		}
+		for(auto profile_it = root["profiles"].begin(); profile_it != root["profiles"].end(); ++profile_it) {
+			const ofJson &profile_node = profile_it.value();
+			if(!profile_node.contains("modes")) {
+				continue;
+			}
+			const ofJson &modes = profile_node["modes"];
+			for(auto mode_it = modes.begin(); mode_it != modes.end(); ++mode_it) {
+				const ofJson &mode_node = mode_it.value();
+				semantic_mode_override entry{};
+				if(mode_node.contains("intensity")) {
+					const ofJson &intensity = mode_node["intensity"];
+					if(intensity.contains("primary")) {
+						entry.intensity_parameters.push_back(intensity["primary"].get<std::string>());
+					}
+					if(intensity.contains("parameters")) {
+						for(const auto &key : intensity["parameters"]) {
+							const std::string value{key.get<std::string>()};
+							if(std::find(entry.intensity_parameters.begin(),
+							             entry.intensity_parameters.end(), value)
+							   == entry.intensity_parameters.end()) {
+								entry.intensity_parameters.push_back(value);
+							}
+						}
+					}
+				}
+				if(mode_node.contains("color")) {
+					const ofJson &color = mode_node["color"];
+					const auto load_groups = [&](const char *field, bool subtractive) {
+						if(!color.contains(field)) {
+							return;
+						}
+						for(const auto &group_node : color[field]) {
+							semantic_color_group group{};
+							group.subtractive = subtractive;
+							group.red = group_node.value("red", std::string{});
+							group.green = group_node.value("green", std::string{});
+							group.blue = group_node.value("blue", std::string{});
+							group.white = group_node.value("white", std::string{});
+							group.cyan = group_node.value("cyan", std::string{});
+							group.magenta = group_node.value("magenta", std::string{});
+							group.yellow = group_node.value("yellow", std::string{});
+							group.dimmer = group_node.value("dimmer", std::string{});
+							entry.color_groups.push_back(group);
+						}
+					};
+					load_groups("rgb", false);
+					load_groups("cmy", true);
+				}
+				table[profile_it.key()][mode_it.key()] = entry;
+			}
+		}
+		return table;
+	}
+
 	struct render_options {
 	public:
 		int universe_base{0};
 		double default_beam_half_angle{8.0};
+		const semantic_overrides *overrides{nullptr};
 	};
 
 	inline fixture_render_state compute_render_state(const fixture_view &view,
@@ -549,55 +663,122 @@ namespace bbb { namespace dmx { namespace ofx {
 		                           (float)instance.position.z};
 
 		const int base{options.universe_base};
-		const auto red = read_parameter(view, "red", universes, base);
-		const auto green = read_parameter(view, "green", universes, base);
-		const auto blue = read_parameter(view, "blue", universes, base);
-		const auto white = read_parameter(view, "white", universes, base);
-		const auto cyan = read_parameter(view, "cyan", universes, base);
-		const auto magenta = read_parameter(view, "magenta", universes, base);
-		const auto yellow = read_parameter(view, "yellow", universes, base);
 
-		ofFloatColor wheel_color{};
-		const bool has_wheel{color_wheel_color(view, universes, base, wheel_color)};
-		if(red.found || green.found || blue.found) {
-			state.color = ofFloatColor{(float)red.normalized, (float)green.normalized, (float)blue.normalized};
-		} else if(cyan.found || magenta.found || yellow.found) {
-			state.color = ofFloatColor{1.f - (float)cyan.normalized,
-			                           1.f - (float)magenta.normalized,
-			                           1.f - (float)yellow.normalized};
-		} else if(has_wheel) {
-			// no additive/subtractive mixing channels: a color wheel is the
-			// fixture's only hue source, so it sets the color outright.
-			state.color = wheel_color;
+		bool color_found{false};
+		bool intensity_found{false};
+		float intensity_value{1.f};
+
+		const semantic_mode_override *override_entry{
+			find_semantic_override(options.overrides, view.profile->key, view.mode->key)};
+		if(override_entry != nullptr) {
+			// explicit color / intensity mapping. multiple color groups (plate +
+			// beam, pixel segments...) collapse to a single emission color by
+			// per-channel max; intensity is the brightest of its contributors.
+			ofFloatColor mixed{0.f, 0.f, 0.f};
+			for(const auto &group : override_entry->color_groups) {
+				ofFloatColor group_color{0.f, 0.f, 0.f};
+				bool group_found{false};
+				if(group.subtractive) {
+					const auto c = read_parameter(view, group.cyan, universes, base);
+					const auto m = read_parameter(view, group.magenta, universes, base);
+					const auto y = read_parameter(view, group.yellow, universes, base);
+					if(c.found || m.found || y.found) {
+						group_color = ofFloatColor{1.f - (float)c.normalized,
+						                           1.f - (float)m.normalized,
+						                           1.f - (float)y.normalized};
+						group_found = true;
+					}
+				} else {
+					const auto r = read_parameter(view, group.red, universes, base);
+					const auto g = read_parameter(view, group.green, universes, base);
+					const auto b = read_parameter(view, group.blue, universes, base);
+					if(r.found || g.found || b.found) {
+						group_color = ofFloatColor{(float)r.normalized, (float)g.normalized, (float)b.normalized};
+						group_found = true;
+					}
+					if(!group.white.empty()) {
+						const auto w = read_parameter(view, group.white, universes, base);
+						if(w.found) {
+							group_color.r = std::min(1.f, group_color.r + (float)w.normalized);
+							group_color.g = std::min(1.f, group_color.g + (float)w.normalized);
+							group_color.b = std::min(1.f, group_color.b + (float)w.normalized);
+							group_found = true;
+						}
+					}
+				}
+				if(group_found) {
+					mixed.r = std::max(mixed.r, group_color.r);
+					mixed.g = std::max(mixed.g, group_color.g);
+					mixed.b = std::max(mixed.b, group_color.b);
+					color_found = true;
+				}
+			}
+			state.color = color_found ? mixed : ofFloatColor{1.f, 1.f, 1.f};
+
+			float max_intensity{0.f};
+			for(const auto &key : override_entry->intensity_parameters) {
+				const auto sample = read_parameter(view, key, universes, base);
+				if(sample.found) {
+					max_intensity = std::max(max_intensity, (float)sample.normalized);
+					intensity_found = true;
+				}
+			}
+			intensity_value = intensity_found ? max_intensity : 1.f;
 		} else {
-			state.color = ofFloatColor{1.f, 1.f, 1.f};
-		}
-		if(white.found) {
-			state.color.r = std::min(1.f, state.color.r + (float)white.normalized);
-			state.color.g = std::min(1.f, state.color.g + (float)white.normalized);
-			state.color.b = std::min(1.f, state.color.b + (float)white.normalized);
-		}
-		const auto amber = read_parameter(view, "amber", universes, base);
-		if(amber.found) {
-			state.color.r = std::min(1.f, state.color.r + (float)amber.normalized);
-			state.color.g = std::min(1.f, state.color.g + 0.55f * (float)amber.normalized);
-		}
-		const auto uv = read_parameter(view, "uv", universes, base);
-		if(uv.found) {
-			state.color.r = std::min(1.f, state.color.r + 0.25f * (float)uv.normalized);
-			state.color.b = std::min(1.f, state.color.b + 0.6f * (float)uv.normalized);
+			// default heuristic: fixed key names (red/green/blue, cyan/magenta/yellow,
+			// color wheel, white/amber/uv), intensity from "dimmer".
+			const auto red = read_parameter(view, "red", universes, base);
+			const auto green = read_parameter(view, "green", universes, base);
+			const auto blue = read_parameter(view, "blue", universes, base);
+			const auto white = read_parameter(view, "white", universes, base);
+			const auto cyan = read_parameter(view, "cyan", universes, base);
+			const auto magenta = read_parameter(view, "magenta", universes, base);
+			const auto yellow = read_parameter(view, "yellow", universes, base);
+
+			ofFloatColor wheel_color{};
+			const bool has_wheel{color_wheel_color(view, universes, base, wheel_color)};
+			if(red.found || green.found || blue.found) {
+				state.color = ofFloatColor{(float)red.normalized, (float)green.normalized, (float)blue.normalized};
+			} else if(cyan.found || magenta.found || yellow.found) {
+				state.color = ofFloatColor{1.f - (float)cyan.normalized,
+				                           1.f - (float)magenta.normalized,
+				                           1.f - (float)yellow.normalized};
+			} else if(has_wheel) {
+				// no additive/subtractive mixing channels: a color wheel is the
+				// fixture's only hue source, so it sets the color outright.
+				state.color = wheel_color;
+			} else {
+				state.color = ofFloatColor{1.f, 1.f, 1.f};
+			}
+			if(white.found) {
+				state.color.r = std::min(1.f, state.color.r + (float)white.normalized);
+				state.color.g = std::min(1.f, state.color.g + (float)white.normalized);
+				state.color.b = std::min(1.f, state.color.b + (float)white.normalized);
+			}
+			const auto amber = read_parameter(view, "amber", universes, base);
+			if(amber.found) {
+				state.color.r = std::min(1.f, state.color.r + (float)amber.normalized);
+				state.color.g = std::min(1.f, state.color.g + 0.55f * (float)amber.normalized);
+			}
+			const auto uv = read_parameter(view, "uv", universes, base);
+			if(uv.found) {
+				state.color.r = std::min(1.f, state.color.r + 0.25f * (float)uv.normalized);
+				state.color.b = std::min(1.f, state.color.b + 0.6f * (float)uv.normalized);
+			}
+			const auto dimmer = read_parameter(view, "dimmer", universes, base);
+			intensity_found = dimmer.found;
+			intensity_value = dimmer.found ? (float)dimmer.normalized : 1.f;
+			color_found = red.found || green.found || blue.found
+				|| white.found || amber.found || uv.found
+				|| cyan.found || magenta.found || yellow.found;
 		}
 
-		const auto dimmer = read_parameter(view, "dimmer", universes, base);
-		state.intensity = dimmer.found ? (float)dimmer.normalized : 1.f;
+		state.intensity = intensity_value;
 		state.intensity *= shutter_factor(view, read_parameter(view, "shutter", universes, base), time);
 
 		const auto pan = read_parameter(view, "pan", universes, base);
 		const auto tilt = read_parameter(view, "tilt", universes, base);
-		state.emitting = dimmer.found || red.found || green.found || blue.found
-			|| white.found || amber.found || uv.found
-			|| cyan.found || magenta.found || yellow.found
-			|| (pan.found && tilt.found);
+		state.emitting = intensity_found || color_found || (pan.found && tilt.found);
 		if(pan.found && tilt.found) {
 			state.mover = true;
 			const auto *pan_parameter = view.mode->find_parameter("pan");
