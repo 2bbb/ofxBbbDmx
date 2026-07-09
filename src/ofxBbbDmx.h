@@ -24,6 +24,7 @@
 #include "bbb/dmx/fixture_json.hpp"
 #include "bbb/dmx/aim.hpp"
 #include "bbb/dmx/color_mapping.hpp"
+#include "bbb/dmx/setup.hpp"
 
 #include "ofMain.h"
 #include "ofJson.h"
@@ -640,11 +641,72 @@ namespace bbb { namespace dmx { namespace ofx {
 		return table;
 	}
 
+	// ------------------------------------------------------------------
+	// shared setup (bbb.dmx.setup.v1): one file bundling the patch,
+	// semantic_overrides, and render defaults. The simulator maps onto the
+	// "fixturemap" object section (common defaults + fixturemap overrides).
+	// Paths inside the setup resolve relative to the setup file itself.
+	// ------------------------------------------------------------------
+
+	struct resolved_setup {
+		bool present{false};   // a setup file exists at the requested path
+		bool ok{false};        // it parsed successfully
+		std::string message{};
+		std::string patch_path{};               // absolute; empty when unset
+		std::string semantic_overrides_path{};  // absolute; empty when unset
+		bool has_default_pan_range{false};
+		double default_pan_range{540.0};
+		bool has_default_tilt_range{false};
+		double default_tilt_range{270.0};
+		bool has_gamma{false};
+		double gamma{1.0};
+		bool has_brightness{false};
+		double brightness{1.0};
+	};
+
+	inline resolved_setup load_setup(const std::string &path) {
+		resolved_setup out{};
+		if(!ofFile::doesFileExist(path)) {
+			return out;
+		}
+		out.present = true;
+		bbb::dmx::dmx_setup_document document{};
+		const auto result = bbb::dmx::read_dmx_setup_file(path, document);
+		if(!result.ok) {
+			out.message = result.message;
+			return out;
+		}
+		const bbb::dmx::dmx_setup_values values{
+			bbb::dmx::merge_setup_values(document.common, document.fixturemap)};
+		const std::string base_directory{bbb::dmx::parent_directory(path)};
+		const auto resolve = [&](const std::optional<std::string> &relative) -> std::string {
+			if(!relative.has_value() || relative->empty()) {
+				return "";
+			}
+			return bbb::dmx::path_is_absolute(*relative)
+				? *relative
+				: bbb::dmx::join_relative_path(base_directory, *relative);
+		};
+		out.patch_path = resolve(values.patch);
+		out.semantic_overrides_path = resolve(values.semantic_overrides);
+		if(values.default_pan_range.has_value())  { out.has_default_pan_range = true;  out.default_pan_range = *values.default_pan_range; }
+		if(values.default_tilt_range.has_value()) { out.has_default_tilt_range = true; out.default_tilt_range = *values.default_tilt_range; }
+		if(values.gamma.has_value())      { out.has_gamma = true;      out.gamma = *values.gamma; }
+		if(values.brightness.has_value()) { out.has_brightness = true; out.brightness = *values.brightness; }
+		out.ok = true;
+		return out;
+	}
+
 	struct render_options {
 	public:
 		int universe_base{0};
 		double default_beam_half_angle{8.0};
 		const semantic_overrides *overrides{nullptr};
+		// bbb.dmx.setup.v1 knobs (defaults = no-op)
+		double default_pan_range{540.0};   // used when a profile's pan lacks range_degrees
+		double default_tilt_range{270.0};  // used when a profile's tilt lacks range_degrees
+		double gamma{1.0};                 // applied to emission color channels
+		double brightness{1.0};            // scales emission intensity
 	};
 
 	inline fixture_render_state compute_render_state(const fixture_view &view,
@@ -775,6 +837,13 @@ namespace bbb { namespace dmx { namespace ofx {
 
 		state.intensity = intensity_value;
 		state.intensity *= shutter_factor(view, read_parameter(view, "shutter", universes, base), time);
+		state.intensity *= (float)options.brightness;
+		if(options.gamma != 1.0 && 0.0 < options.gamma) {
+			const float g{(float)options.gamma};
+			state.color.r = std::pow(state.color.r, g);
+			state.color.g = std::pow(state.color.g, g);
+			state.color.b = std::pow(state.color.b, g);
+		}
 
 		const auto pan = read_parameter(view, "pan", universes, base);
 		const auto tilt = read_parameter(view, "tilt", universes, base);
@@ -783,8 +852,8 @@ namespace bbb { namespace dmx { namespace ofx {
 			state.mover = true;
 			const auto *pan_parameter = view.mode->find_parameter("pan");
 			const auto *tilt_parameter = view.mode->find_parameter("tilt");
-			const double pan_range{bbb::dmx::sanitize_positive_range(pan_parameter->range_degrees, 540.0)};
-			const double tilt_range{bbb::dmx::sanitize_positive_range(tilt_parameter->range_degrees, 270.0)};
+			const double pan_range{bbb::dmx::sanitize_positive_range(pan_parameter->range_degrees, options.default_pan_range)};
+			const double tilt_range{bbb::dmx::sanitize_positive_range(tilt_parameter->range_degrees, options.default_tilt_range)};
 			const std::uint16_t pan16{(std::uint16_t)(pan_parameter->type == bbb::dmx::fixture_parameter_type::u8 ? pan.raw << 8 : pan.raw)};
 			const std::uint16_t tilt16{(std::uint16_t)(tilt_parameter->type == bbb::dmx::fixture_parameter_type::u8 ? tilt.raw << 8 : tilt.raw)};
 			double pan_degrees{bbb::dmx::u16_to_angle(pan16, pan_range)};
