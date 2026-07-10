@@ -24,6 +24,7 @@
 #include "bbb/dmx/fixture_json.hpp"
 #include "bbb/dmx/aim.hpp"
 #include "bbb/dmx/color_mapping.hpp"
+#include "bbb/dmx/shutter_mapping.hpp"
 #include "bbb/dmx/setup.hpp"
 
 #include "ofMain.h"
@@ -428,6 +429,12 @@ namespace bbb { namespace dmx { namespace ofx {
 		}
 		const auto *parameter = view.valid() ? view.mode->find_parameter("shutter") : nullptr;
 		if(parameter != nullptr && 2 <= parameter->ranges.size()) {
+			// GDTF converts StrobeDuration/Rate channels to the "shutter" key on
+			// some fixtures (e.g. GLP JDC1); those are continuous effect modifiers,
+			// not the shutter itself, so live DMX on them must not blink the beam.
+			if(bbb::dmx::shutter_parameter_is_rate_or_duration_like(*view.mode, *parameter)) {
+				return 1.f;
+			}
 			const bbb::dmx::fixture_parameter_range *match{nullptr};
 			for(const auto &range : parameter->ranges) {
 				if(range.from <= shutter.raw && shutter.raw <= range.to) {
@@ -437,6 +444,9 @@ namespace bbb { namespace dmx { namespace ofx {
 			}
 			if(match == nullptr) {
 				return 1.f;
+			}
+			if(bbb::dmx::shutter_range_is_no_effect(*match)) {
+				return 1.f;  // "No effect" range: lit, even if function happens to be strobe/etc.
 			}
 			const double span{(double)std::max(1, match->to - match->from)};
 			const double position{(shutter.raw - match->from) / span};
